@@ -49,19 +49,86 @@ type StreamMeta = {
 };
 
 const TOKEN_WARN = 200_000;
-const CITE_SPLIT = /(\[\d+\])/g;
-const LS_LIB = "research-lib-active-library";
-const LS_SPLIT = "research-lib-panel-width";
+const LS_LIB = "bibtalk-active-library";
+const LS_SPLIT = "bibtalk-panel-width";
 
-const mdComponents: Components = {
-  a({ href, children }) {
-    return (
-      <a href={href} target="_blank" rel="noreferrer">
-        {children}
-      </a>
+function normalizeChatMarkdown(source: string): string {
+  return source
+    .replace(/\r\n/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trimEnd();
+}
+
+/** Keeps ``` fenced blocks unchanged so [n] inside code is not turned into links. */
+function transformCitationBrackets(
+  source: string,
+  citationByNumber: Record<string, string> | undefined
+): string {
+  if (!citationByNumber || Object.keys(citationByNumber).length === 0) {
+    return source;
+  }
+  const fence = /```[\s\S]*?```/g;
+  const out: string[] = [];
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = fence.exec(source)) !== null) {
+    out.push(
+      transformCitationSegment(
+        source.slice(last, m.index),
+        citationByNumber
+      )
     );
-  },
-};
+    out.push(m[0]);
+    last = m.index + m[0].length;
+  }
+  out.push(transformCitationSegment(source.slice(last), citationByNumber));
+  return out.join("");
+}
+
+function transformCitationSegment(
+  segment: string,
+  citationByNumber: Record<string, string>
+): string {
+  return segment.replace(/\[(\d+)\]/g, (full, num: string) => {
+    if (citationByNumber[num]) {
+      return `[${num}](#cite-${num})`;
+    }
+    return full;
+  });
+}
+
+/** Heading line must be followed by a newline; body is everything before it. */
+function splitSourcesSection(text: string): {
+  body: string;
+  heading: string | null;
+  sources: string | null;
+} {
+  const re =
+    /(?:^|\n)((?:#+\s*)?(?:\*\*)?(?:Sources|References|Bibliography)(?:\*\*)?:?(?:\s*\([^)]*\))?)\s*\n([\s\S]*)$/i;
+  const m = text.match(re);
+  if (!m || m.index === undefined) {
+    return { body: text, heading: null, sources: null };
+  }
+  const body = text.slice(0, m.index).replace(/\s+$/, "");
+  const heading = m[1].trim();
+  const sources = m[2];
+  return { body, heading, sources };
+}
+
+/** One markdown paragraph per numbered source when the model jams them on one line. */
+function formatSourcesBlock(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return trimmed;
+  const pieces = trimmed
+    .split(/(?=\[\d+\])/g)
+    .map((p) => p.trim())
+    .filter(Boolean);
+  if (pieces.length > 1) {
+    return pieces.join("\n\n");
+  }
+  return trimmed;
+}
 
 function approxTokens(text: string) {
   return Math.max(1, Math.floor(text.length / 4));
@@ -119,36 +186,73 @@ function AssistantMarkdown(props: {
   onOpen: (num: string) => void;
 }) {
   const { text, citationByNumber, onOpen } = props;
-  const parts = text.split(CITE_SPLIT);
-  return (
-    <div className="md-chat">
-      {parts.map((part, i) => {
-        const m = part.match(/^\[(\d+)\]$/);
-        if (m && citationByNumber?.[m[1]]) {
-          return (
-            <button
-              type="button"
-              key={`c-${i}`}
-              className="cite-btn"
-              title="Open paper details"
-              onClick={() => onOpen(m[1])}
-            >
-              [{m[1]}]
-            </button>
-          );
+
+  const { body, heading, sources } = useMemo(() => {
+    const normalized = normalizeChatMarkdown(text);
+    return splitSourcesSection(normalized);
+  }, [text]);
+
+  const bodyMd = useMemo(
+    () => transformCitationBrackets(body, citationByNumber),
+    [body, citationByNumber]
+  );
+
+  const sourcesMd = useMemo(() => {
+    if (heading == null || sources == null) return null;
+    const block = formatSourcesBlock(sources);
+    const light = block.replace(/\r\n/g, "\n").trimEnd();
+    return transformCitationBrackets(light, citationByNumber);
+  }, [heading, sources, citationByNumber]);
+
+  const components = useMemo<Components>(
+    () => ({
+      a({ href, children }) {
+        if (href?.startsWith("#cite-")) {
+          const num = href.slice("#cite-".length);
+          if (citationByNumber?.[num]) {
+            return (
+              <button
+                type="button"
+                className="cite-btn"
+                title="Open paper details"
+                onClick={() => onOpen(num)}
+              >
+                [{num}]
+              </button>
+            );
+          }
         }
-        if (!part) return null;
         return (
-          <ReactMarkdown
-            key={`md-${i}`}
-            remarkPlugins={[remarkGfm]}
-            components={mdComponents}
-          >
-            {part}
-          </ReactMarkdown>
+          <a href={href} target="_blank" rel="noreferrer">
+            {children}
+          </a>
         );
-      })}
-    </div>
+      },
+    }),
+    [citationByNumber, onOpen]
+  );
+
+  const showBody = bodyMd.trim().length > 0;
+  const showSources =
+    heading != null && sourcesMd != null && sourcesMd.trim().length > 0;
+
+  return (
+    <>
+      {showBody ? (
+        <div className="md-chat">
+          <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+            {bodyMd}
+          </ReactMarkdown>
+        </div>
+      ) : null}
+      {showSources ? (
+        <div className="md-chat md-chat-sources">
+          <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+            {`${heading}\n\n${sourcesMd}`}
+          </ReactMarkdown>
+        </div>
+      ) : null}
+    </>
   );
 }
 
@@ -502,7 +606,7 @@ export default function App() {
   return (
     <div className="layout-flex">
       <div className="left-panel" style={{ width: leftWidth, maxWidth: "78vw" }}>
-        <h1>Research library assistant</h1>
+        <h1>BibTalk</h1>
         <p className="meta-line">
           Organise uploads into separate libraries. Chat and the paper list are scoped to the
           library you select.
